@@ -52,11 +52,6 @@ class Block(ABC):
 
     @property
     @abstractmethod
-    def extra_hash(self) -> Optional[int]:
-        return None
-
-    @property
-    @abstractmethod
     def computed(self) -> bool:
         raise NotImplementedError
 
@@ -86,8 +81,6 @@ class Block(ABC):
             block_size: int,
             allocator: "BlockAllocator",
             block_id: Optional[int] = None,
-            computed: bool = False,
-            extra_hash: Optional[int] = None,
         ) -> "Block":
             pass
 
@@ -106,20 +99,18 @@ class Block(ABC):
 class BlockAllocator(ABC):
 
     @abstractmethod
-    def allocate_mutable_block(self, prev_block: Optional[Block],
-                               extra_hash: Optional[int]) -> Block:
+    def allocate_mutable_block(self, prev_block: Optional[Block]) -> Block:
         pass
 
     @abstractmethod
     def allocate_immutable_block(self, prev_block: Optional[Block],
-                                 token_ids: List[int],
-                                 extra_hash: Optional[int]) -> Block:
+                                 token_ids: List[int]) -> Block:
         pass
 
     @abstractmethod
-    def allocate_immutable_blocks(self, prev_block: Optional[Block],
-                                  block_token_ids: List[List[int]],
-                                  extra_hash: Optional[int]) -> List[Block]:
+    def allocate_immutable_blocks(
+            self, prev_block: Optional[Block],
+            block_token_ids: List[List[int]]) -> List[Block]:
         pass
 
     @abstractmethod
@@ -169,6 +160,12 @@ class BlockAllocator(ABC):
         pass
 
     @abstractmethod
+    def get_computed_block_ids(self, prev_computed_block_ids: List[int],
+                               block_ids: List[int],
+                               skip_last_block_id: bool) -> List[int]:
+        pass
+
+    @abstractmethod
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         pass
@@ -195,39 +192,24 @@ class BlockAllocator(ABC):
     class NoFreeBlocksError(ValueError):
         pass
 
-    @abstractmethod
-    def find_cached_blocks_prefix(
-        self,
-        block_hashes: List[int],
-    ) -> List[int]:
-        pass
-
 
 class DeviceAwareBlockAllocator(ABC):
 
     @abstractmethod
-    def allocate_mutable_block(self,
-                               prev_block: Optional[Block],
-                               device: Device,
-                               extra_hash: Optional[int] = None) -> Block:
+    def allocate_mutable_block(self, prev_block: Optional[Block],
+                               device: Device) -> Block:
         pass
 
     @abstractmethod
-    def allocate_immutable_block(self,
-                                 prev_block: Optional[Block],
+    def allocate_immutable_block(self, prev_block: Optional[Block],
                                  token_ids: List[int],
-                                 device: Device,
-                                 extra_hash: Optional[int] = None) -> Block:
+                                 device: Device) -> Block:
         pass
 
     @abstractmethod
-    def allocate_immutable_blocks(
-        self,
-        prev_block: Optional[Block],
-        block_token_ids: List[List[int]],
-        device: Device,
-        extra_hash: Optional[int] = None,
-    ) -> List[Block]:
+    def allocate_immutable_blocks(self, prev_block: Optional[Block],
+                                  block_token_ids: List[List[int]],
+                                  device: Device) -> List[Block]:
         pass
 
     @abstractmethod
@@ -265,6 +247,12 @@ class DeviceAwareBlockAllocator(ABC):
         pass
 
     @abstractmethod
+    def get_computed_block_ids(self, prev_computed_block_ids: List[int],
+                               block_ids: List[int],
+                               skip_last_block_id: bool) -> List[int]:
+        pass
+
+    @abstractmethod
     def get_common_computed_block_ids(
             self, computed_seq_block_ids: List[List[int]]) -> List[int]:
         pass
@@ -295,12 +283,4 @@ class DeviceAwareBlockAllocator(ABC):
     @abstractmethod
     def get_prefix_cache_hit_rate(self, device: Device) -> float:
         """Prefix cache hit rate. -1 means not supported or disabled."""
-        pass
-
-    @abstractmethod
-    def find_cached_blocks_prefix(
-        self,
-        block_hashes: List[int],
-        device: Device = Device.GPU,
-    ) -> List[int]:
         pass

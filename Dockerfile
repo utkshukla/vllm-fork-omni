@@ -11,7 +11,6 @@ ARG CUDA_VERSION=12.4.1
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS base
 ARG CUDA_VERSION=12.4.1
 ARG PYTHON_VERSION=3.12
-ARG TARGETPLATFORM
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
@@ -47,14 +46,9 @@ WORKDIR /workspace
 # install build and runtime dependencies
 COPY requirements-common.txt requirements-common.txt
 COPY requirements-cuda.txt requirements-cuda.txt
-COPY requirements-cuda-arm64.txt requirements-cuda-arm64.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -r requirements-cuda.txt
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        python3 -m pip install -r requirements-cuda-arm64.txt; \
-    fi
 
 # cuda arch list used by torch
 # can be useful for both `dev` and `test`
@@ -69,18 +63,12 @@ ENV VLLM_FA_CMAKE_GPU_ARCHES=${vllm_fa_cmake_gpu_arches}
 
 #################### WHEEL BUILD IMAGE ####################
 FROM base AS build
-ARG TARGETPLATFORM
 
 # install build dependencies
 COPY requirements-build.txt requirements-build.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -r requirements-build.txt
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        python3 -m pip install -r requirements-cuda-arm64.txt; \
-    fi
 
 COPY . .
 ARG GIT_REPO_CHECK=0
@@ -146,8 +134,8 @@ COPY requirements-test.txt requirements-test.txt
 COPY requirements-dev.txt requirements-dev.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -r requirements-dev.txt
-#################### DEV IMAGE ####################
 
+#################### DEV IMAGE ####################
 #################### vLLM installation IMAGE ####################
 # image with vLLM installed
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04 AS vllm-base
@@ -155,9 +143,6 @@ ARG CUDA_VERSION=12.4.1
 ARG PYTHON_VERSION=3.12
 WORKDIR /vllm-workspace
 ENV DEBIAN_FRONTEND=noninteractive
-ARG TARGETPLATFORM
-
-COPY requirements-cuda-arm64.txt requirements-cuda-arm64.txt
 
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
@@ -183,24 +168,17 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 # or future versions of triton.
 RUN ldconfig /usr/local/cuda-$(echo $CUDA_VERSION | cut -d. -f1,2)/compat/
 
-# Install vllm wheel first, so that torch etc will be installed.
+# install vllm wheel first, so that torch etc will be installed
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/vllm-workspace/dist \
     --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install dist/*.whl --verbose
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        pip uninstall -y torch && \
-        python3 -m pip install -r requirements-cuda-arm64.txt; \
-    fi
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-. /etc/environment && \
-if [ "$TARGETPLATFORM" != "linux/arm64" ]; then \
-    python3 -m pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.1.6/flashinfer-0.1.6+cu121torch2.4-cp${PYTHON_VERSION_STR}-cp${PYTHON_VERSION_STR}-linux_x86_64.whl; \
-fi
+    . /etc/environment && \
+    python3 -m pip install https://github.com/flashinfer-ai/flashinfer/releases/download/v0.1.6/flashinfer-0.1.6+cu121torch2.4-cp${PYTHON_VERSION_STR}-cp${PYTHON_VERSION_STR}-linux_x86_64.whl
 COPY examples examples
 #################### vLLM installation IMAGE ####################
+
 
 #################### TEST IMAGE ####################
 # image to run unit testing suite
@@ -213,24 +191,13 @@ ADD . /vllm-workspace/
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install -r requirements-dev.txt
 
-# install development dependencies (for testing)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -e tests/vllm_test_utils
-
-# enable fast downloads from hf (for testing)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install hf_transfer
-ENV HF_HUB_ENABLE_HF_TRANSFER 1
-
-# Copy in the v1 package for testing (it isn't distributed yet)
-COPY vllm/v1 /usr/local/lib/python3.12/dist-packages/vllm/v1
-
 # doc requires source code
 # we hide them inside `test_docs/` , so that this source code
 # will not be imported by other tests
 RUN mkdir test_docs
 RUN mv docs test_docs/
 RUN mv vllm test_docs/
+
 #################### TEST IMAGE ####################
 
 #################### OPENAI API SERVER ####################
@@ -239,11 +206,8 @@ FROM vllm-base AS vllm-openai
 
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
-        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.42.0' 'timm==0.9.10'; \
-    else \
-        pip install accelerate hf_transfer 'modelscope!=1.15.0' 'bitsandbytes>=0.45.0' 'timm==0.9.10'; \
-    fi
+    pip install accelerate hf_transfer 'modelscope!=1.15.0' bitsandbytes>=0.44.0 timm==0.9.10
+
 ENV VLLM_USAGE_SOURCE production-docker-image
 
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]

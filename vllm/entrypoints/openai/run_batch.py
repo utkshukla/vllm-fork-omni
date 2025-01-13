@@ -78,11 +78,6 @@ def parse_args():
         help="Port number for the Prometheus metrics server "
         "(only needed if enable-metrics is set).",
     )
-    parser.add_argument(
-        "--enable-prompt-tokens-details",
-        action='store_true',
-        default=False,
-        help="If set to True, enable prompt_tokens_details in usage.")
 
     return parser.parse_args()
 
@@ -125,7 +120,7 @@ async def read_file(path_or_url: str) -> str:
                    session.get(path_or_url) as resp:
             return await resp.text()
     else:
-        with open(path_or_url, encoding="utf-8") as f:
+        with open(path_or_url, "r", encoding="utf-8") as f:
             return f.read()
 
 
@@ -222,17 +217,13 @@ async def main(args):
         prompt_adapters=None,
         request_logger=request_logger,
         chat_template=None,
-        chat_template_content_format="auto",
-        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-    ) if model_config.runner_type == "generate" else None
+    )
     openai_serving_embedding = OpenAIServingEmbedding(
         engine,
         model_config,
         base_model_paths,
         request_logger=request_logger,
-        chat_template=None,
-        chat_template_content_format="auto",
-    ) if model_config.runner_type == "pooling" else None
+    )
 
     tracker = BatchProgressTracker()
     logger.info("Reading batch from %s...", args.input_file)
@@ -249,31 +240,14 @@ async def main(args):
 
         # Determine the type of request and run it.
         if request.url == "/v1/chat/completions":
-            handler_fn = (None if openai_serving_chat is None else
-                          openai_serving_chat.create_chat_completion)
-            if handler_fn is None:
-                response_futures.append(
-                    make_async_error_request_output(
-                        request,
-                        error_msg=
-                        "The model does not support Chat Completions API",
-                    ))
-                continue
-
-            response_futures.append(run_request(handler_fn, request, tracker))
+            response_futures.append(
+                run_request(openai_serving_chat.create_chat_completion,
+                            request, tracker))
             tracker.submitted()
         elif request.url == "/v1/embeddings":
-            handler_fn = (None if openai_serving_embedding is None else
-                          openai_serving_embedding.create_embedding)
-            if handler_fn is None:
-                response_futures.append(
-                    make_async_error_request_output(
-                        request,
-                        error_msg="The model does not support Embeddings API",
-                    ))
-                continue
-
-            response_futures.append(run_request(handler_fn, request, tracker))
+            response_futures.append(
+                run_request(openai_serving_embedding.create_embedding, request,
+                            tracker))
             tracker.submitted()
         else:
             response_futures.append(

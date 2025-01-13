@@ -5,7 +5,6 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.distributed import (tensor_model_parallel_all_gather,
                               tensor_model_parallel_gather)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -43,23 +42,20 @@ class LogitsProcessor(nn.Module):
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
-
-        self.use_gather = not current_platform.is_tpu(
-        ) and not envs.VLLM_USE_V1
+        self.use_gather = not current_platform.is_tpu()
 
     def forward(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
-        sampling_metadata: Optional[SamplingMetadata] = None,
+        sampling_metadata: SamplingMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self.logits_as_input:
             logits = hidden_states
         else:
-            if sampling_metadata is not None:
-                hidden_states = _prune_hidden_states(hidden_states,
-                                                     sampling_metadata)
+            hidden_states = _prune_hidden_states(hidden_states,
+                                                 sampling_metadata)
 
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
@@ -73,8 +69,7 @@ class LogitsProcessor(nn.Module):
                 logits *= self.scale
 
             # Apply logits processors (if any).
-            if sampling_metadata is not None:
-                logits = _apply_logits_processors(logits, sampling_metadata)
+            logits = _apply_logits_processors(logits, sampling_metadata)
 
         return logits
 
@@ -114,14 +109,8 @@ def _prune_hidden_states(
     hidden_states: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
-    # NOTE(kzawora): The if guard is needed for Gaudi - in some scenarios
-    # (warmup, profile_run) we might not have selected_token_indices,
-    # so we skip pruning.
-    if sampling_metadata.selected_token_indices is not None:
-        return hidden_states.index_select(
-            0, sampling_metadata.selected_token_indices)
-    else:
-        return hidden_states
+    return hidden_states.index_select(0,
+                                      sampling_metadata.selected_token_indices)
 
 
 def _apply_logits_processors(

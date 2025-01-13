@@ -1,3 +1,4 @@
+# coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/opt/modeling_opt.py
 # Copyright 2023 The vLLM team.
@@ -16,15 +17,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only OPT model compatible with HuggingFace weights."""
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import OPTConfig
 
 from vllm.attention import Attention, AttentionMetadata
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -33,7 +33,7 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.model_executor.layers.sampler import Sampler, SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -42,8 +42,7 @@ from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP
 from .utils import (is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers,
-                    maybe_prefix)
+                    make_empty_intermediate_tensors_factory, make_layers)
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -68,7 +67,6 @@ class OPTAttention(nn.Module):
         bias: bool = True,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -86,21 +84,18 @@ class OPTAttention(nn.Module):
             total_num_heads,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
         )
         self.out_proj = RowParallelLinear(
             embed_dim,
             embed_dim,
             bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.out_proj",
         )
         self.attn = Attention(self.num_heads,
                               self.head_dim,
                               scale=self.scaling,
                               cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn")
+                              quant_config=quant_config)
 
     def forward(
         self,
@@ -122,7 +117,6 @@ class OPTDecoderLayer(nn.Module):
         config: OPTConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -133,7 +127,6 @@ class OPTDecoderLayer(nn.Module):
             bias=config.enable_bias,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
         )
         self.do_layer_norm_before = config.do_layer_norm_before
 
@@ -145,15 +138,14 @@ class OPTDecoderLayer(nn.Module):
             config.ffn_dim,
             bias=config.enable_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
         )
-        self.activation_fn = get_act_fn(config.activation_function)
+        self.activation_fn = get_act_fn(config.activation_function,
+                                        quant_config, config.ffn_dim)
         self.fc2 = RowParallelLinear(
             config.ffn_dim,
             self.embed_dim,
             bias=config.enable_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
         )
         self.final_layer_norm = nn.LayerNorm(
             self.embed_dim,
@@ -221,8 +213,7 @@ class OPTDecoder(nn.Module):
             self.project_out = ReplicatedLinear(config.hidden_size,
                                                 config.word_embed_proj_dim,
                                                 bias=False,
-                                                quant_config=quant_config,
-                                                prefix=f"{prefix}.project_out")
+                                                quant_config=quant_config)
         else:
             self.project_out = None
 
@@ -230,8 +221,7 @@ class OPTDecoder(nn.Module):
             self.project_in = ReplicatedLinear(config.word_embed_proj_dim,
                                                config.hidden_size,
                                                bias=False,
-                                               quant_config=quant_config,
-                                               prefix=f"{prefix}.project_in")
+                                               quant_config=quant_config)
         else:
             self.project_in = None
 
@@ -248,8 +238,7 @@ class OPTDecoder(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: OPTDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix),
+            lambda prefix: OPTDecoderLayer(config, cache_config, quant_config),
             prefix=f"{prefix}.layers")
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -290,20 +279,16 @@ class OPTDecoder(nn.Module):
         return hidden_states
 
 
-@support_torch_compile
 class OPTModel(nn.Module):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: OPTConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-
-        self.decoder = OPTDecoder(config,
-                                  cache_config,
-                                  quant_config,
-                                  prefix=f"{prefix}.decoder")
+        self.decoder = OPTDecoder(config, cache_config, quant_config)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(["hidden_states"],
                                                     config.hidden_size))
@@ -337,28 +322,31 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         "k_proj": ("qkv_proj", 1),
         "v_proj": ("qkv_proj", 2),
     }
+    default_bitsandbytes_target_modules = [
+        ".q_proj.", ".k_proj.", ".v_proj.", ".out_proj.", ".fc1.", ".fc2."
+    ]
+    # in TP, these weights are partitioned along the column dimension (dim=-1)
+    column_parallel_weights_modules = [".out_proj.", ".fc2."]
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
+    def __init__(
+        self,
+        config: OPTConfig,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = OPTModel(vllm_config=vllm_config,
-                              prefix=maybe_prefix(prefix, "model"))
+        self.model = OPTModel(config, cache_config, quant_config)
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.decoder.embed_tokens
         else:
             self.lm_head = ParallelLMHead(config.vocab_size,
                                           config.word_embed_proj_dim)
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -367,11 +355,9 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
-                                   inputs_embeds)
+                                   attn_metadata, intermediate_tensors)
         return hidden_states
 
     def compute_logits(
@@ -391,8 +377,7 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -400,7 +385,6 @@ class OPTForCausalLM(nn.Module, SupportsPP):
             ("qkv_proj", "v_proj", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if "lm_head.weight" in name and self.config.tie_word_embeddings:
                 continue
@@ -430,5 +414,3 @@ class OPTForCausalLM(nn.Module, SupportsPP):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params

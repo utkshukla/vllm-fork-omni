@@ -15,17 +15,17 @@
 # limitations under the License.
 import copy
 import json
+import math
 from collections import defaultdict
 from functools import lru_cache
 from typing import Callable, DefaultDict, Dict, List, Union
 
-import numpy as np
 import torch
 from lark import Lark
 from outlines import grammars
 from outlines.caching import cache
 from outlines.fsm.guide import CFGGuide, Generate, Guide, RegexGuide, Write
-from outlines_core.fsm.json_schema import build_regex_from_schema
+from outlines.fsm.json_schema import build_regex_from_schema
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
 
@@ -77,17 +77,9 @@ class BaseLogitsProcessor:
                 f"Unsupported instruction type {type(instruction)}")
 
         mask = torch.full((scores.shape[-1], ),
-                          -torch.inf,
+                          -math.inf,
                           device=scores.device)
-        # The tokenizer may support more token ids than the model can generate,
-        # eg. Llama 3.2 Vision models have an `<|image|>` token with id 128256
-        # but scores.shape == torch.Size([128256])
-        # Using NumPy is faster for filtering token ids
-        allowed_tokens = np.array(allowed_tokens, dtype=np.int64)
-        allowed_tokens = torch.tensor(allowed_tokens, device=scores.device)
-        allowed_tokens = allowed_tokens.masked_select(
-            allowed_tokens < scores.shape[-1])
-        mask.index_fill_(0, allowed_tokens, 0)
+        mask[allowed_tokens] = 0
         scores.add_(mask)
         return scores
 
@@ -99,7 +91,7 @@ class RegexLogitsProcessor(BaseLogitsProcessor):
     def _get_guide(cls, regex_string: str,
                    tokenizer: PreTrainedTokenizerBase) -> Guide:
         tokenizer = _adapt_tokenizer(tokenizer)
-        return RegexGuide.from_regex(regex_string, tokenizer)
+        return RegexGuide(regex_string, tokenizer)
 
     def __init__(self, regex_string: str, tokenizer: PreTrainedTokenizerBase):
         """Compile the FSM that drives the regex-structured generation.

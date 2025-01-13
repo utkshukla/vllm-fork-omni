@@ -1,7 +1,7 @@
 """
 This example shows how to use vLLM for running offline inference with
-multi-image input on vision language models for text generation,
-using the chat template defined by the model.
+multi-image input on vision language models, using the chat template defined
+by the model.
 """
 from argparse import Namespace
 from typing import List, NamedTuple, Optional
@@ -31,217 +31,6 @@ class ModelRequestData(NamedTuple):
 # NOTE: The default `max_num_seqs` and `max_model_len` may result in OOM on
 # lower-end GPUs.
 # Unless specified, these settings have been tested to work on a single L4.
-
-
-def load_aria(question, image_urls: List[str]) -> ModelRequestData:
-    model_name = "rhymes-ai/Aria"
-    llm = LLM(model=model_name,
-              tokenizer_mode="slow",
-              trust_remote_code=True,
-              dtype="bfloat16",
-              limit_mm_per_prompt={"image": len(image_urls)})
-    placeholders = "<fim_prefix><|img|><fim_suffix>\n" * len(image_urls)
-    prompt = (f"<|im_start|>user\n{placeholders}{question}<|im_end|>\n"
-              "<|im_start|>assistant\n")
-    stop_token_ids = [93532, 93653, 944, 93421, 1019, 93653, 93519]
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=stop_token_ids,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None)
-
-
-def load_h2onvl(question: str, image_urls: List[str]) -> ModelRequestData:
-    model_name = "h2oai/h2ovl-mississippi-2b"
-
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        max_model_len=8192,
-        limit_mm_per_prompt={"image": len(image_urls)},
-        mm_processor_kwargs={"max_dynamic_patch": 4},
-    )
-
-    placeholders = "\n".join(f"Image-{i}: <image>\n"
-                             for i, _ in enumerate(image_urls, start=1))
-    messages = [{'role': 'user', 'content': f"{placeholders}\n{question}"}]
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=True)
-    prompt = tokenizer.apply_chat_template(messages,
-                                           tokenize=False,
-                                           add_generation_prompt=True)
-
-    # Stop tokens for H2OVL-Mississippi
-    # https://huggingface.co/h2oai/h2ovl-mississippi-2b
-    stop_token_ids = [tokenizer.eos_token_id]
-
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=stop_token_ids,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
-
-
-def load_idefics3(question, image_urls: List[str]) -> ModelRequestData:
-    model_name = "HuggingFaceM4/Idefics3-8B-Llama3"
-
-    # The configuration below has been confirmed to launch on a single L40 GPU.
-    llm = LLM(
-        model=model_name,
-        max_model_len=8192,
-        max_num_seqs=16,
-        enforce_eager=True,
-        limit_mm_per_prompt={"image": len(image_urls)},
-        # if you are running out of memory, you can reduce the "longest_edge".
-        # see: https://huggingface.co/HuggingFaceM4/Idefics3-8B-Llama3#model-optimizations
-        mm_processor_kwargs={
-            "size": {
-                "longest_edge": 2 * 364
-            },
-        },
-    )
-
-    placeholders = "\n".join(f"Image-{i}: <image>\n"
-                             for i, _ in enumerate(image_urls, start=1))
-    prompt = f"<|begin_of_text|>User:{placeholders}\n{question}<end_of_utterance>\nAssistant:"  # noqa: E501
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=None,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
-
-
-def load_internvl(question: str, image_urls: List[str]) -> ModelRequestData:
-    model_name = "OpenGVLab/InternVL2-2B"
-
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        max_model_len=4096,
-        limit_mm_per_prompt={"image": len(image_urls)},
-        mm_processor_kwargs={"max_dynamic_patch": 4},
-    )
-
-    placeholders = "\n".join(f"Image-{i}: <image>\n"
-                             for i, _ in enumerate(image_urls, start=1))
-    messages = [{'role': 'user', 'content': f"{placeholders}\n{question}"}]
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=True)
-    prompt = tokenizer.apply_chat_template(messages,
-                                           tokenize=False,
-                                           add_generation_prompt=True)
-
-    # Stop tokens for InternVL
-    # models variants may have different stop tokens
-    # please refer to the model card for the correct "stop words":
-    # https://huggingface.co/OpenGVLab/InternVL2-2B/blob/main/conversation.py
-    stop_tokens = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|end|>"]
-    stop_token_ids = [tokenizer.convert_tokens_to_ids(i) for i in stop_tokens]
-
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=stop_token_ids,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
-
-
-def load_mllama(question, image_urls: List[str]) -> ModelRequestData:
-    model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
-
-    # The configuration below has been confirmed to launch on a single L40 GPU.
-    llm = LLM(
-        model=model_name,
-        max_model_len=4096,
-        max_num_seqs=16,
-        enforce_eager=True,
-        limit_mm_per_prompt={"image": len(image_urls)},
-    )
-
-    prompt = f"<|image|><|image|><|begin_of_text|>{question}"
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=None,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
-
-
-def load_nvlm_d(question: str, image_urls: List[str]):
-    model_name = "nvidia/NVLM-D-72B"
-
-    # Adjust this as necessary to fit in GPU
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True,
-        max_model_len=8192,
-        tensor_parallel_size=4,
-        limit_mm_per_prompt={"image": len(image_urls)},
-        mm_processor_kwargs={"max_dynamic_patch": 4},
-    )
-
-    placeholders = "\n".join(f"Image-{i}: <image>\n"
-                             for i, _ in enumerate(image_urls, start=1))
-    messages = [{'role': 'user', 'content': f"{placeholders}\n{question}"}]
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                              trust_remote_code=True)
-    prompt = tokenizer.apply_chat_template(messages,
-                                           tokenize=False,
-                                           add_generation_prompt=True)
-    stop_token_ids = None
-
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=stop_token_ids,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
-
-
-def load_phi3v(question: str, image_urls: List[str]) -> ModelRequestData:
-    # num_crops is an override kwarg to the multimodal image processor;
-    # For some models, e.g., Phi-3.5-vision-instruct, it is recommended
-    # to use 16 for single frame scenarios, and 4 for multi-frame.
-    #
-    # Generally speaking, a larger value for num_crops results in more
-    # tokens per image instance, because it may scale the image more in
-    # the image preprocessing. Some references in the model docs and the
-    # formula for image tokens after the preprocessing
-    # transform can be found below.
-    #
-    # https://huggingface.co/microsoft/Phi-3.5-vision-instruct#loading-the-model-locally
-    # https://huggingface.co/microsoft/Phi-3.5-vision-instruct/blob/main/processing_phi3_v.py#L194
-    llm = LLM(
-        model="microsoft/Phi-3.5-vision-instruct",
-        trust_remote_code=True,
-        max_model_len=4096,
-        max_num_seqs=2,
-        limit_mm_per_prompt={"image": len(image_urls)},
-        mm_processor_kwargs={"num_crops": 4},
-    )
-    placeholders = "\n".join(f"<|image_{i}|>"
-                             for i, _ in enumerate(image_urls, start=1))
-    prompt = f"<|user|>\n{placeholders}\n{question}<|end|>\n<|assistant|>\n"
-    stop_token_ids = None
-
-    return ModelRequestData(
-        llm=llm,
-        prompt=prompt,
-        stop_token_ids=stop_token_ids,
-        image_data=[fetch_image(url) for url in image_urls],
-        chat_template=None,
-    )
 
 
 def load_qwenvl_chat(question: str, image_urls: List[str]) -> ModelRequestData:
@@ -280,6 +69,111 @@ def load_qwenvl_chat(question: str, image_urls: List[str]) -> ModelRequestData:
         stop_token_ids=stop_token_ids,
         image_data=[fetch_image(url) for url in image_urls],
         chat_template=chat_template,
+    )
+
+
+def load_phi3v(question: str, image_urls: List[str]) -> ModelRequestData:
+    # num_crops is an override kwarg to the multimodal image processor;
+    # For some models, e.g., Phi-3.5-vision-instruct, it is recommended
+    # to use 16 for single frame scenarios, and 4 for multi-frame.
+    #
+    # Generally speaking, a larger value for num_crops results in more
+    # tokens per image instance, because it may scale the image more in
+    # the image preprocessing. Some references in the model docs and the
+    # formula for image tokens after the preprocessing
+    # transform can be found below.
+    #
+    # https://huggingface.co/microsoft/Phi-3.5-vision-instruct#loading-the-model-locally
+    # https://huggingface.co/microsoft/Phi-3.5-vision-instruct/blob/main/processing_phi3_v.py#L194
+    llm = LLM(
+        model="microsoft/Phi-3.5-vision-instruct",
+        trust_remote_code=True,
+        max_model_len=4096,
+        max_num_seqs=2,
+        limit_mm_per_prompt={"image": len(image_urls)},
+        mm_processor_kwargs={"num_crops": 4},
+    )
+    placeholders = "\n".join(f"<|image_{i}|>"
+                             for i, _ in enumerate(image_urls, start=1))
+    prompt = f"<|user|>\n{placeholders}\n{question}<|end|>\n<|assistant|>\n"
+    stop_token_ids = None
+
+    return ModelRequestData(
+        llm=llm,
+        prompt=prompt,
+        stop_token_ids=stop_token_ids,
+        image_data=[fetch_image(url) for url in image_urls],
+        chat_template=None,
+    )
+
+
+def load_internvl(question: str, image_urls: List[str]) -> ModelRequestData:
+    model_name = "OpenGVLab/InternVL2-2B"
+
+    llm = LLM(
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=4096,
+        limit_mm_per_prompt={"image": len(image_urls)},
+        mm_processor_kwargs={"max_dynamic_patch": 4},
+    )
+
+    placeholders = "\n".join(f"Image-{i}: <image>\n"
+                             for i, _ in enumerate(image_urls, start=1))
+    messages = [{'role': 'user', 'content': f"{placeholders}\n{question}"}]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              trust_remote_code=True)
+    prompt = tokenizer.apply_chat_template(messages,
+                                           tokenize=False,
+                                           add_generation_prompt=True)
+
+    # Stop tokens for InternVL
+    # models variants may have different stop tokens
+    # please refer to the model card for the correct "stop words":
+    # https://huggingface.co/OpenGVLab/InternVL2-2B#service
+    stop_tokens = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|end|>"]
+    stop_token_ids = [tokenizer.convert_tokens_to_ids(i) for i in stop_tokens]
+
+    return ModelRequestData(
+        llm=llm,
+        prompt=prompt,
+        stop_token_ids=stop_token_ids,
+        image_data=[fetch_image(url) for url in image_urls],
+        chat_template=None,
+    )
+
+
+def load_nvlm_d(question: str, image_urls: List[str]):
+    model_name = "nvidia/NVLM-D-72B"
+
+    # Adjust this as necessary to fit in GPU
+    llm = LLM(
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=8192,
+        tensor_parallel_size=4,
+        limit_mm_per_prompt={"image": len(image_urls)},
+        mm_processor_kwargs={"max_dynamic_patch": 4},
+    )
+
+    placeholders = "\n".join(f"Image-{i}: <image>\n"
+                             for i, _ in enumerate(image_urls, start=1))
+    messages = [{'role': 'user', 'content': f"{placeholders}\n{question}"}]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name,
+                                              trust_remote_code=True)
+    prompt = tokenizer.apply_chat_template(messages,
+                                           tokenize=False,
+                                           add_generation_prompt=True)
+    stop_token_ids = None
+
+    return ModelRequestData(
+        llm=llm,
+        prompt=prompt,
+        stop_token_ids=stop_token_ids,
+        image_data=[fetch_image(url) for url in image_urls],
+        chat_template=None,
     )
 
 
@@ -340,16 +234,35 @@ def load_qwen2_vl(question, image_urls: List[str]) -> ModelRequestData:
     )
 
 
+def load_mllama(question, image_urls: List[str]) -> ModelRequestData:
+    model_name = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+
+    # The configuration below has been confirmed to launch on a single L40 GPU.
+    llm = LLM(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=16,
+        enforce_eager=True,
+        limit_mm_per_prompt={"image": len(image_urls)},
+    )
+
+    prompt = f"<|image|><|image|><|begin_of_text|>{question}"
+    return ModelRequestData(
+        llm=llm,
+        prompt=prompt,
+        stop_token_ids=None,
+        image_data=[fetch_image(url) for url in image_urls],
+        chat_template=None,
+    )
+
+
 model_example_map = {
-    "aria": load_aria,
-    "h2ovl_chat": load_h2onvl,
-    "idefics3": load_idefics3,
-    "internvl_chat": load_internvl,
-    "mllama": load_mllama,
-    "NVLM_D": load_nvlm_d,
     "phi3_v": load_phi3v,
-    "qwen_vl_chat": load_qwenvl_chat,
+    "internvl_chat": load_internvl,
+    "NVLM_D": load_nvlm_d,
     "qwen2_vl": load_qwen2_vl,
+    "qwen_vl_chat": load_qwenvl_chat,
+    "mllama": load_mllama,
 }
 
 
@@ -421,8 +334,7 @@ def main(args: Namespace):
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
         description='Demo on using vLLM for offline inference with '
-        'vision language models that support multi-image input for text '
-        'generation')
+        'vision language models that support multi-image input')
     parser.add_argument('--model-type',
                         '-m',
                         type=str,

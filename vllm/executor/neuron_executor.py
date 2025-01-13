@@ -7,7 +7,6 @@ from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest
 from vllm.utils import (get_distributed_init_method, get_ip, get_open_port,
                         make_async)
-from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
 
@@ -26,16 +25,18 @@ class NeuronExecutor(ExecutorBase):
         self._init_worker()
 
     def _init_worker(self):
-        wrapper = WorkerWrapperBase(vllm_config=self.vllm_config)
+        from vllm.worker.neuron_worker import NeuronWorker
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
-        wrapper.init_worker(
-            vllm_config=self.vllm_config,
+        self.driver_worker = NeuronWorker(
+            model_config=self.model_config,
+            parallel_config=self.parallel_config,
+            scheduler_config=self.scheduler_config,
+            device_config=self.device_config,
+            cache_config=self.cache_config,
             local_rank=0,
             rank=0,
-            distributed_init_method=distributed_init_method,
-        )
-        self.driver_worker = wrapper.worker
+            distributed_init_method=distributed_init_method)
         self.driver_worker.init_device()
         self.driver_worker.load_model()
 

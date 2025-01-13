@@ -6,9 +6,10 @@ from typing import List
 import pytest
 
 import vllm
-from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.lora.request import LoRARequest
-from vllm.platforms import current_platform
+from vllm.utils import is_hip
+
+from .conftest import cleanup
 
 
 @dataclass
@@ -19,7 +20,7 @@ class ModelWithQuantization:
 
 MODELS: List[ModelWithQuantization]
 #AWQ quantization is currently not supported in ROCm.
-if current_platform.is_rocm():
+if is_hip():
     MODELS = [
         ModelWithQuantization(
             model_path="TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ",
@@ -84,8 +85,7 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
         tensor_parallel_size=tp_size,
         gpu_memory_utilization=0.2,  #avoid OOM
         quantization=model.quantization,
-        trust_remote_code=True,
-        enable_chunked_prefill=True)
+        trust_remote_code=True)
 
     if model.quantization is None:
         expected_no_lora_output = [
@@ -160,7 +160,7 @@ def test_quant_model_lora(tinyllama_lora_files, num_gpus_available, model,
     print("removing lora")
 
     del llm
-    cleanup_dist_env_and_memory()
+    cleanup()
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -177,12 +177,11 @@ def test_quant_model_tp_equality(tinyllama_lora_files, num_gpus_available,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.2,  #avoid OOM
         quantization=model.quantization,
-        trust_remote_code=True,
-        enable_chunked_prefill=True)
+        trust_remote_code=True)
     output_tp1 = do_sample(llm_tp1, tinyllama_lora_files, lora_id=1)
 
     del llm_tp1
-    cleanup_dist_env_and_memory()
+    cleanup()
 
     llm_tp2 = vllm.LLM(
         model=model.model_path,
@@ -191,11 +190,10 @@ def test_quant_model_tp_equality(tinyllama_lora_files, num_gpus_available,
         max_loras=4,
         tensor_parallel_size=2,
         gpu_memory_utilization=0.2,  #avoid OOM
-        quantization=model.quantization,
-        enable_chunked_prefill=True)
+        quantization=model.quantization)
     output_tp2 = do_sample(llm_tp2, tinyllama_lora_files, lora_id=1)
 
     del llm_tp2
-    cleanup_dist_env_and_memory()
+    cleanup()
 
     assert output_tp1 == output_tp2

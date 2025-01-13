@@ -1,8 +1,6 @@
-from .base import MultiModalPlaceholderMap, MultiModalPlugin
-from .inputs import (BatchedTensorInputs, MultiModalData,
-                     MultiModalDataBuiltins, MultiModalDataDict,
-                     MultiModalKwargs, MultiModalPlaceholderDict,
-                     NestedTensors)
+from .base import (BatchedTensorInputs, MultiModalDataBuiltins,
+                   MultiModalDataDict, MultiModalInputs, MultiModalPlugin,
+                   NestedTensors)
 from .registry import MultiModalRegistry
 
 MULTIMODAL_REGISTRY = MultiModalRegistry()
@@ -16,12 +14,9 @@ See also:
 
 __all__ = [
     "BatchedTensorInputs",
-    "MultiModalData",
     "MultiModalDataBuiltins",
     "MultiModalDataDict",
-    "MultiModalKwargs",
-    "MultiModalPlaceholderDict",
-    "MultiModalPlaceholderMap",
+    "MultiModalInputs",
     "MultiModalPlugin",
     "NestedTensors",
     "MULTIMODAL_REGISTRY",

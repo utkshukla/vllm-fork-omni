@@ -4,10 +4,11 @@ from typing import Any, Dict, Optional
 import torch
 
 from vllm.platforms import current_platform
+from vllm.utils import seed_everything
 
 
 def set_random_seed(seed: int) -> None:
-    current_platform.seed_everything(seed)
+    seed_everything(seed)
 
 
 def set_weight_attrs(

@@ -22,15 +22,14 @@ class MockHFConfig:
 
 @dataclass
 class MockModelConfig:
-    task = "generate"
     tokenizer = MODEL_NAME
     trust_remote_code = False
     tokenizer_mode = "auto"
     max_model_len = 100
     tokenizer_revision = None
+    embedding_mode = False
     multimodal_config = MultiModalConfig()
     hf_config = MockHFConfig()
-    logits_processor_pattern = None
 
 
 @dataclass
@@ -49,7 +48,6 @@ async def _async_serving_chat_init():
                                            BASE_MODEL_PATHS,
                                            response_role="assistant",
                                            chat_template=CHAT_TEMPLATE,
-                                           chat_template_content_format="auto",
                                            lora_modules=None,
                                            prompt_adapters=None,
                                            request_logger=None)
@@ -71,7 +69,6 @@ def test_serving_chat_should_set_correct_max_tokens():
                                      BASE_MODEL_PATHS,
                                      response_role="assistant",
                                      chat_template=CHAT_TEMPLATE,
-                                     chat_template_content_format="auto",
                                      lora_modules=None,
                                      prompt_adapters=None,
                                      request_logger=None)

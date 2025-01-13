@@ -1,19 +1,17 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from PIL import Image
+from transformers.image_processing_base import BatchFeature
 
+from vllm.config import ModelConfig
 from vllm.inputs.registry import InputContext
 from vllm.logger import init_logger
 from vllm.transformers_utils.processor import get_image_processor
 from vllm.utils import is_list_of
 
-from .base import MultiModalPlugin
-from .inputs import ImageItem, MultiModalData, MultiModalKwargs
-
-if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+from .base import MultiModalData, MultiModalInputs, MultiModalPlugin
 
 logger = init_logger(__name__)
 
@@ -28,7 +26,7 @@ class ImagePlugin(MultiModalPlugin):
 
     def _get_hf_image_processor(
         self,
-        model_config: "ModelConfig",
+        model_config: ModelConfig,
         mm_processor_kwargs: Optional[Dict[str, Any]] = None,
     ):
         if mm_processor_kwargs is None:
@@ -41,10 +39,14 @@ class ImagePlugin(MultiModalPlugin):
     def _default_input_mapper(
         self,
         ctx: InputContext,
-        data: MultiModalData[ImageItem],
+        data: MultiModalData[object],
         **mm_processor_kwargs,
-    ) -> MultiModalKwargs:
+    ) -> MultiModalInputs:
         model_config = ctx.model_config
+
+        # Processed by input processor
+        if isinstance(data, BatchFeature):
+            return MultiModalInputs(data.data)
 
         # PIL image
         if isinstance(data, Image.Image) or is_list_of(data, Image.Image):
@@ -74,11 +76,11 @@ class ImagePlugin(MultiModalPlugin):
                     type(image_processor).__name__)
                 raise
 
-            return MultiModalKwargs(batch_data)
+            return MultiModalInputs(batch_data)
 
         # Image embedding
         elif isinstance(data, torch.Tensor) or is_list_of(data, torch.Tensor):
-            return MultiModalKwargs({"image_embeds": data})
+            return MultiModalInputs({"image_embeds": data})
 
         raise TypeError(f"Invalid image type: {type(data)}")
 

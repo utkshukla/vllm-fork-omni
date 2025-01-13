@@ -1,7 +1,6 @@
 import dataclasses
 import time
 import weakref
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple,
                     Type, TypeVar)
@@ -10,7 +9,9 @@ import torch
 import torch.nn as nn
 
 from vllm.attention import get_attn_backend
-from vllm.config import VllmConfig
+from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
+                         ModelConfig, ObservabilityConfig, ParallelConfig,
+                         PromptAdapterConfig, SchedulerConfig)
 from vllm.distributed import get_pp_group
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
@@ -18,8 +19,7 @@ from vllm.model_executor import SamplingMetadataCache
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
-                             MultiModalKwargs, MultiModalPlaceholderMap,
-                             MultiModalRegistry)
+                             MultiModalInputs, MultiModalRegistry)
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import DeviceMemoryProfiler, make_tensor_with_pad
@@ -37,6 +37,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
+_BATCH_SIZE_ALIGNMENT = 8
+_BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
+    _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
+]
 
 TModelInputForXPU = TypeVar('TModelInputForXPU', bound="ModelInputForXPU")
 
@@ -156,10 +160,7 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         input_positions: List[int] = []
         slot_mapping: List[int] = []
         seq_lens: List[int] = []
-        multi_modal_kwargs_list: List[MultiModalKwargs] = []
-        multi_modal_placeholder_maps: Dict[
-            str,
-            MultiModalPlaceholderMap] = defaultdict(MultiModalPlaceholderMap)
+        multi_modal_inputs_list: List[MultiModalInputs] = []
 
         for seq_group_metadata in seq_group_metadata_list:
             assert seq_group_metadata.is_prompt
@@ -178,29 +179,7 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
             # Token position ids
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
-            positions_range = range(computed_len, seq_len)
-            input_positions.extend(list(positions_range))
-
-            if seq_group_metadata.multi_modal_data:
-                # NOTE: mm_data only includes the subset of multi-modal items
-                # that intersect with the current prefill positions.
-                mm_data, placeholder_maps = MultiModalPlaceholderMap \
-                    .from_seq_group(seq_group_metadata, positions_range)
-
-                if self.runner.mm_registry.has_processor(
-                        self.runner.model_config):
-                    mm_kwargs = mm_data
-                else:
-                    mm_kwargs = self.runner.multi_modal_input_mapper(
-                        mm_data,
-                        seq_group_metadata.mm_processor_kwargs,
-                    )
-
-                multi_modal_kwargs_list.append(mm_kwargs)
-
-                for modality, placeholder_map in placeholder_maps.items():
-                    multi_modal_placeholder_maps[modality].extend(
-                        placeholder_map)
+            input_positions.extend(list(range(computed_len, seq_len)))
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -241,11 +220,6 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         slot_mapping = torch.tensor(slot_mapping,
                                     dtype=torch.long,
                                     device=self.device)  # type: ignore
-        placeholder_index_maps = {
-            modality: placeholder_map.index_map()
-            for modality, placeholder_map in
-            multi_modal_placeholder_maps.items()
-        }
 
         max_seqlen = max(seq_lens)
         tmp = [0]
@@ -256,7 +230,6 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=True,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=placeholder_index_maps,
             seq_lens=seq_lens,
             seqlen_q=seqlen_q,
             max_seqlen=max_seqlen,
@@ -268,7 +241,7 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
             block_tables=torch.tensor([], device=self.device, dtype=torch.int),
         )
 
-        multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
+        multi_modal_kwargs = MultiModalInputs.batch(multi_modal_inputs_list)
 
         return (input_tokens, input_positions, attn_metadata, seq_lens,
                 multi_modal_kwargs)
@@ -340,7 +313,6 @@ class ModelInputForXPUBuilder(ModelRunnerInputBuilderBase[ModelInputForXPU]):
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None,
             seq_lens=seq_lens,
             seqlen_q=torch.tensor([]),
             max_seqlen=0,
@@ -365,18 +337,33 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        device_config: DeviceConfig,
+        cache_config: CacheConfig,
+        load_config: LoadConfig,
+        lora_config: Optional[LoRAConfig],
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
+        prompt_adapter_config: Optional[PromptAdapterConfig] = None,
         return_hidden_states: bool = False,
+        observability_config: Optional[ObservabilityConfig] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-
-        ModelRunnerBase.__init__(self, vllm_config=vllm_config)
-        model_config = self.model_config
-        cache_config = self.cache_config
+        self.model_config = model_config
+        self.parallel_config = parallel_config
+        self.scheduler_config = scheduler_config
+        self.device_config = device_config
+        self.cache_config = cache_config
+        self.lora_config = lora_config
+        self.load_config = load_config
         self.is_driver_worker = is_driver_worker
+        self.prompt_adapter_config = prompt_adapter_config
+        self.observability_config = observability_config
+        if self.observability_config is not None:
+            print(f"observability_config is {self.observability_config}")
         self.return_hidden_states = return_hidden_states
 
         self.device = self.device_config.device
@@ -387,6 +374,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
 
         self.attn_backend = get_attn_backend(
             self.model_config.get_head_size(),
+            self.model_config.get_sliding_window(),
             self.model_config.dtype,
             self.kv_cache_dtype,
             self.block_size,
@@ -409,7 +397,15 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
 
     def load_model(self) -> None:
         with DeviceMemoryProfiler() as m:
-            self.model = get_model(vllm_config=self.vllm_config)
+            self.model = get_model(
+                model_config=self.model_config,
+                device_config=self.device_config,
+                load_config=self.load_config,
+                lora_config=self.lora_config,
+                parallel_config=self.parallel_config,
+                scheduler_config=self.scheduler_config,
+                cache_config=self.cache_config,
+            )
 
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
@@ -455,7 +451,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
                        (group_id < max_num_batched_tokens % max_num_seqs))
             batch_size += seq_len
 
-            dummy_data = self.input_registry \
+            seq_data, dummy_multi_modal_data = self.input_registry \
                 .dummy_data_for_profiling(self.model_config,
                                           seq_len,
                                           self.mm_registry)
@@ -463,12 +459,12 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
                 is_prompt=True,
-                seq_data={group_id: dummy_data.seq_data},
+                seq_data={group_id: seq_data},
                 sampling_params=sampling_params,
                 block_tables=None,
                 lora_request=None,
-                multi_modal_data=dummy_data.multi_modal_data,
-                multi_modal_placeholders=dummy_data.multi_modal_placeholders)
+                multi_modal_data=dummy_multi_modal_data,
+            )
             seqs.append(seq)
 
         # Run the model with the dummy inputs.
@@ -569,7 +565,7 @@ class XPUModelRunner(ModelRunnerBase[ModelInputForXPUWithSamplingMetadata]):
             kv_caches=kv_caches,
             attn_metadata=model_input.attn_metadata,
             intermediate_tensors=intermediate_tensors,
-            **MultiModalKwargs.as_kwargs(model_input.multi_modal_kwargs or {},
+            **MultiModalInputs.as_kwargs(model_input.multi_modal_kwargs or {},
                                          device=self.device))
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:

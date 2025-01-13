@@ -1,3 +1,4 @@
+import enum
 import os
 from contextlib import contextmanager
 from functools import lru_cache
@@ -8,10 +9,22 @@ import torch
 import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.logger import init_logger
-from vllm.platforms import _Backend, current_platform
-from vllm.utils import STR_BACKEND_ENV_VAR
+from vllm.platforms import current_platform
+from vllm.utils import STR_BACKEND_ENV_VAR, is_cpu, is_hip, is_openvino, is_xpu
 
 logger = init_logger(__name__)
+
+
+class _Backend(enum.Enum):
+    FLASH_ATTN = enum.auto()
+    XFORMERS = enum.auto()
+    ROCM_FLASH = enum.auto()
+    TORCH_SDPA = enum.auto()
+    OPENVINO = enum.auto()
+    FLASHINFER = enum.auto()
+    PALLAS = enum.auto()
+    IPEX = enum.auto()
+    NO_ATTENTION = enum.auto()
 
 
 def backend_name_to_enum(backend_name: str) -> _Backend:
@@ -74,8 +87,10 @@ def get_global_forced_attn_backend() -> Optional[_Backend]:
     return forced_attn_backend
 
 
+@lru_cache(maxsize=None)
 def get_attn_backend(
     head_size: int,
+    sliding_window: Optional[int],
     dtype: torch.dtype,
     kv_cache_dtype: Optional[str],
     block_size: int,
@@ -83,48 +98,19 @@ def get_attn_backend(
     is_blocksparse: bool = False,
 ) -> Type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
-    # Accessing envs.* behind an @lru_cache decorator can cause the wrong
-    # value to be returned from the cache if the value changes between calls.
-    # To avoid this, we read envs.VLLM_USE_V1 here and pass it explicitly to the
-    # private function.
-    return _cached_get_attn_backend(
-        head_size=head_size,
-        dtype=dtype,
-        kv_cache_dtype=kv_cache_dtype,
-        block_size=block_size,
-        is_attention_free=is_attention_free,
-        is_blocksparse=is_blocksparse,
-        use_v1=envs.VLLM_USE_V1,
-    )
 
-
-@lru_cache(maxsize=None)
-def _cached_get_attn_backend(
-    head_size: int,
-    dtype: torch.dtype,
-    kv_cache_dtype: Optional[str],
-    block_size: int,
-    is_attention_free: bool,
-    is_blocksparse: bool = False,
-    use_v1: bool = False,
-) -> Type[AttentionBackend]:
     if is_blocksparse:
         logger.info("Using BlocksparseFlashAttention backend.")
         from vllm.attention.backends.blocksparse_attn import (
             BlocksparseFlashAttentionBackend)
         return BlocksparseFlashAttentionBackend
 
-    backend = which_attn_to_use(head_size, dtype, kv_cache_dtype, block_size,
-                                is_attention_free, use_v1)
+    backend = which_attn_to_use(head_size, sliding_window, dtype,
+                                kv_cache_dtype, block_size, is_attention_free)
     if backend == _Backend.FLASH_ATTN:
-        logger.info("Using Flash Attention backend.")
         from vllm.attention.backends.flash_attn import (  # noqa: F401
             FlashAttentionBackend)
         return FlashAttentionBackend
-    if backend == _Backend.FLASH_ATTN_VLLM_V1:
-        from vllm.v1.attention.backends.flash_attn import (  # noqa: F401
-            FlashAttentionBackend as FlashAttentionBackendV1)
-        return FlashAttentionBackendV1
     if backend == _Backend.XFORMERS:
         logger.info("Using XFormers backend.")
         from vllm.attention.backends.xformers import (  # noqa: F401
@@ -136,7 +122,7 @@ def _cached_get_attn_backend(
             ROCmFlashAttentionBackend)
         return ROCmFlashAttentionBackend
     elif backend == _Backend.TORCH_SDPA:
-        assert current_platform.is_cpu(), RuntimeError(
+        assert is_cpu(), RuntimeError(
             "Torch SDPA backend is only used for the CPU device.")
         logger.info("Using Torch SDPA backend.")
         from vllm.attention.backends.torch_sdpa import TorchSDPABackend
@@ -146,7 +132,7 @@ def _cached_get_attn_backend(
         from vllm.attention.backends.openvino import OpenVINOAttentionBackend
         return OpenVINOAttentionBackend
     elif backend == _Backend.IPEX:
-        assert current_platform.is_xpu(), RuntimeError(
+        assert is_xpu(), RuntimeError(
             "IPEX attention backend is only used for the XPU device.")
         logger.info("Using IPEX attention backend.")
         from vllm.attention.backends.ipex_attn import IpexAttnBackend
@@ -155,10 +141,6 @@ def _cached_get_attn_backend(
         logger.info("Using Flashinfer backend.")
         from vllm.attention.backends.flashinfer import FlashInferBackend
         return FlashInferBackend
-    elif backend == _Backend.HPU_ATTN:
-        logger.info("Using HPUAttention backend.")
-        from vllm.attention.backends.hpu_attn import HPUAttentionBackend
-        return HPUAttentionBackend
     elif backend == _Backend.PALLAS:
         logger.info("Using Pallas backend.")
         from vllm.attention.backends.pallas import PallasAttentionBackend
@@ -171,12 +153,14 @@ def _cached_get_attn_backend(
         raise ValueError("Invalid attention backend.")
 
 
-def which_attn_to_use(head_size: int,
-                      dtype: torch.dtype,
-                      kv_cache_dtype: Optional[str],
-                      block_size: int,
-                      is_attention_free: bool,
-                      use_v1: bool = False) -> _Backend:
+def which_attn_to_use(
+    head_size: int,
+    sliding_window: Optional[int],
+    dtype: torch.dtype,
+    kv_cache_dtype: Optional[str],
+    block_size: int,
+    is_attention_free: bool,
+) -> _Backend:
     """Returns which flash attention backend to use."""
     # Default case.
     selected_backend = _Backend.FLASH_ATTN
@@ -201,14 +185,37 @@ def which_attn_to_use(head_size: int,
         if backend_by_env_var is not None:
             selected_backend = backend_name_to_enum(backend_by_env_var)
 
-    # get device-specific default attn_backend
-    default_backend = current_platform.get_default_attn_backend(
-        selected_backend)
-    if default_backend is not None:
-        return default_backend
+    if is_cpu():
+        if selected_backend != _Backend.TORCH_SDPA:
+            logger.info("Cannot use %s backend on CPU.", selected_backend)
+        return _Backend.TORCH_SDPA
 
-    if use_v1:
-        return _Backend.FLASH_ATTN_VLLM_V1
+    if is_openvino():
+        if selected_backend != _Backend.OPENVINO:
+            logger.info("Cannot use %s backend on OpenVINO.", selected_backend)
+        return _Backend.OPENVINO
+
+    if is_xpu():
+        if selected_backend != _Backend.IPEX:
+            logger.info("Cannot use %s backend on XPU.", selected_backend)
+        return _Backend.IPEX
+
+    if current_platform.is_tpu():
+        if selected_backend != _Backend.PALLAS:
+            logger.info("Cannot use %s backend on TPU.", selected_backend)
+        return _Backend.PALLAS
+
+    if is_hip():
+        # AMD GPUs.
+        selected_backend = (_Backend.ROCM_FLASH if selected_backend
+                            == _Backend.FLASH_ATTN else selected_backend)
+        if selected_backend == _Backend.ROCM_FLASH:
+            if not current_platform.has_device_capability(90):
+                # not Instinct series GPUs.
+                logger.info("flash_attn is not supported on NAVI GPUs.")
+        else:
+            logger.info("%s is not supported in AMD GPUs.", selected_backend)
+        return _Backend.ROCM_FLASH
 
     # FlashAttn in NVIDIA GPUs.
     if selected_backend == _Backend.FLASH_ATTN:
@@ -235,6 +242,10 @@ def which_attn_to_use(head_size: int,
             logger.info(
                 "Cannot use FlashAttention-2 backend for block size not "
                 "divisible by 16.")
+            selected_backend = _Backend.XFORMERS
+        elif sliding_window is not None:
+            logger.info(
+                "Cannot use FlashAttention-2 backend due to sliding window.")
             selected_backend = _Backend.XFORMERS
 
     # FlashAttn is valid for the model, checking if the package is installed.

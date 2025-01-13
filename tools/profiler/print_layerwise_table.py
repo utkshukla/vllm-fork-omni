@@ -34,10 +34,9 @@ if __name__ == "__main__":
                         "examples/offline_profile.py")
     parser.add_argument("--phase",
                         type=str,
+                        choices=["prefill", "decode_1"],
                         required=True,
-                        help="The phase to print the table for. This is either"
-                        "prefill or decode_n, where n is the decode step "
-                        "number")
+                        help="The phase to print the table for.")
     parser.add_argument("--table",
                         type=str,
                         choices=["summary", "model"],
@@ -47,12 +46,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    with open(args.json_trace) as f:
+    with open(args.json_trace, "r") as f:
         profile_data = json.load(f)
-
-    assert args.phase in profile_data, \
-       (f"Cannot find phase {args.phase} in profile data. Choose one among"
-        f'{[x for x in profile_data.keys() if "prefill" in x or "decode" in x]}') #noqa
 
     if args.table == "summary":
         entries_and_depths = flatten_entries(
