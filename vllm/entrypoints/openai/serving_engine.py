@@ -484,4 +484,5 @@ class OpenAIServing:
         return f"Success: LoRA adapter '{lora_name}' removed successfully."
 
     def _is_model_supported(self, model_name):
+        logger.info(f"Base model paths {self.base_model_paths}")
         return any(model.name == model_name for model in self.base_model_paths)
